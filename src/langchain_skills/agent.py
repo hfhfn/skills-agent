@@ -15,6 +15,7 @@ LangChain Skills Agent 主体
 - 事件级流式输出 (thinking / text / tool_call / tool_result)
 """
 
+import logging
 import os
 from pathlib import Path
 from typing import Optional, Iterator
@@ -22,12 +23,15 @@ from typing import Optional, Iterator
 from dotenv import load_dotenv
 from langchain.agents import create_agent
 from langchain.chat_models import init_chat_model
-from langchain_core.messages import AIMessage, AIMessageChunk
+from langchain_core.messages import AIMessage, AIMessageChunk, HumanMessage, ToolMessage
 from langgraph.checkpoint.memory import InMemorySaver
 
+from .memory import MemoryConfig, MemoryMiddleware, MemoryRetriever, ConversationSummarizer
 from .skill_loader import SkillLoader
 from .tools import ALL_TOOLS, SkillAgentContext
 from .stream import StreamEventEmitter, ToolCallTracker, is_success, DisplayLimits
+
+logger = logging.getLogger(__name__)
 
 
 # 加载环境变量（override=True 确保 .env 文件覆盖系统环境变量）
@@ -150,8 +154,295 @@ class LangChainSkillsAgent:
             working_directory=self.working_directory,
         )
 
+        # 初始化 checkpointer（PostgreSQL 或 InMemory）
+        self.checkpointer = self._get_checkpointer()
+
+        # 初始化三层记忆系统
+        self.memory_config = MemoryConfig.from_env()
+        self.summarizer = self._create_summarizer()
+        self.retriever = self._create_retriever()
+        self.memory_middleware = MemoryMiddleware(
+            config=self.memory_config,
+            summarizer=self.summarizer,
+            retriever=self.retriever,
+            model_name=self.model_name,
+            system_prompt=self.system_prompt,
+        )
+
+        # 将 retriever 注入到上下文中供 recall_memory 工具使用
+        self.context.memory_retriever = self.retriever
+
         # 创建 LangChain Agent
         self.agent = self._create_agent()
+
+    def _get_checkpointer(self):
+        """
+        获取 checkpointer 实例
+
+        优先使用 PostgreSQL 持久化（需要 DATABASE_URL 环境变量），
+        未配置时 fallback 到 InMemorySaver（保持零依赖可运行）。
+        """
+        db_url = os.getenv("DATABASE_URL")
+        if db_url:
+            try:
+                from psycopg import Connection
+                from psycopg.rows import dict_row
+                from langgraph.checkpoint.postgres import PostgresSaver
+
+                conn = Connection.connect(
+                    db_url,
+                    autocommit=True,
+                    prepare_threshold=0,
+                    row_factory=dict_row,
+                )
+                checkpointer = PostgresSaver(conn)
+                checkpointer.setup()
+                self._pg_conn = conn  # keep reference for conversation management
+                self._setup_thread_activity_table()
+                return checkpointer
+            except Exception as e:
+                import warnings
+                warnings.warn(
+                    f"Failed to initialize PostgreSQL checkpointer: {e}. "
+                    "Falling back to InMemorySaver."
+                )
+        return InMemorySaver()
+
+    def _setup_thread_activity_table(self):
+        """创建 thread_activity 和 conversation_summaries 表。"""
+        conn = getattr(self, "_pg_conn", None)
+        if not conn:
+            return
+        with conn.cursor() as cur:
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS thread_activity (
+                    thread_id TEXT PRIMARY KEY,
+                    label TEXT,
+                    last_active_at TIMESTAMPTZ NOT NULL DEFAULT now()
+                )
+            """)
+            # Add label column if table already exists without it
+            cur.execute("""
+                ALTER TABLE thread_activity ADD COLUMN IF NOT EXISTS label TEXT
+            """)
+
+    def _prune_thread_messages(self, thread_id: str):
+        """如果线程消息数超过限制，摘要旧消息并修剪。"""
+        max_messages = self.memory_config.max_messages_per_thread
+        config = {"configurable": {"thread_id": thread_id}}
+        try:
+            state = self.agent.get_state(config)
+        except Exception:
+            return
+        if not state or not state.values:
+            return
+        messages = state.values.get("messages", [])
+        if len(messages) <= max_messages:
+            return
+
+        prune_count = len(messages) - max_messages + 20
+        to_prune = messages[:prune_count]
+
+        # Extract topics from pruned messages
+        topics = []
+        if self.summarizer:
+            topics = self.summarizer.extract_topics(to_prune)
+
+        # Store pruned messages to vector DB before removing
+        if self.retriever:
+            self.retriever.store_messages(thread_id, to_prune, topics=topics)
+
+        # Update summary
+        existing_summary = self.summarizer.load_summary(thread_id) if self.summarizer else None
+        if self.summarizer:
+            self.summarizer.generate_and_store(thread_id, to_prune, existing_summary)
+
+        # Remove old messages from state via RemoveMessage
+        try:
+            from langchain_core.messages import RemoveMessage
+            removals = [RemoveMessage(id=m.id) for m in to_prune if m.id]
+            if removals:
+                self.agent.update_state(config, {"messages": removals})
+                logger.info(
+                    "Pruned %d messages from thread %s (had %d, limit %d, topics: %s)",
+                    len(removals), thread_id, len(messages), max_messages, topics,
+                )
+        except Exception as e:
+            logger.warning("Failed to prune messages for thread %s: %s", thread_id, e)
+
+    def _touch_thread_activity(self, thread_id: str, label: str | None = None):
+        """更新线程的最后活跃时间，首次创建时可设置 label。"""
+        conn = getattr(self, "_pg_conn", None)
+        if not conn:
+            return
+        try:
+            with conn.cursor() as cur:
+                if label:
+                    cur.execute(
+                        "INSERT INTO thread_activity (thread_id, label, last_active_at) "
+                        "VALUES (%s, %s, now()) "
+                        "ON CONFLICT (thread_id) DO UPDATE SET last_active_at = now()",
+                        (thread_id, label),
+                    )
+                else:
+                    cur.execute(
+                        "INSERT INTO thread_activity (thread_id, last_active_at) "
+                        "VALUES (%s, now()) "
+                        "ON CONFLICT (thread_id) DO UPDATE SET last_active_at = now()",
+                        (thread_id,),
+                    )
+        except Exception:
+            pass  # non-critical, don't break the chat flow
+
+    def _create_summarizer(self) -> Optional[ConversationSummarizer]:
+        """Create conversation summarizer if PostgreSQL is available."""
+        pg_conn = getattr(self, "_pg_conn", None)
+        if not pg_conn or not self.memory_config.enable_summary:
+            return None
+
+        # Create a lightweight LLM for summarization (use same credentials)
+        try:
+            api_key, base_url = get_credentials()
+            init_kwargs = {"temperature": 0.3, "max_tokens": 2000}
+            if api_key:
+                init_kwargs["api_key"] = api_key
+            if base_url:
+                init_kwargs["base_url"] = base_url
+
+            model_provider = os.getenv("MODEL_PROVIDER")
+            provider_kwargs = {}
+            if model_provider:
+                provider_kwargs["model_provider"] = model_provider
+
+            summary_llm = init_chat_model(
+                self.model_name,
+                **provider_kwargs,
+                **init_kwargs,
+            )
+            return ConversationSummarizer(
+                pg_conn=pg_conn,
+                llm=summary_llm,
+                max_summary_tokens=self.memory_config.max_summary_tokens,
+            )
+        except Exception as e:
+            logger.warning("Failed to create summarizer LLM: %s", e)
+            return ConversationSummarizer(
+                pg_conn=pg_conn,
+                llm=None,
+                max_summary_tokens=self.memory_config.max_summary_tokens,
+            )
+
+    def _create_retriever(self) -> Optional[MemoryRetriever]:
+        """Create memory retriever if PostgreSQL is available."""
+        pg_conn = getattr(self, "_pg_conn", None)
+        if not pg_conn:
+            return None
+
+        # Create embedding model
+        embedding_model = None
+        try:
+            api_key, base_url = get_credentials()
+            model_provider = os.getenv("MODEL_PROVIDER")
+
+            # Embedding credentials: dedicated env vars > general credentials
+            embed_base_url = self.memory_config.embedding_base_url or base_url
+            embed_api_key = self.memory_config.embedding_api_key or api_key
+
+            if model_provider == "openai" or (embed_base_url and not model_provider):
+                from langchain_openai import OpenAIEmbeddings
+                embed_kwargs = {}
+                if embed_api_key:
+                    embed_kwargs["api_key"] = embed_api_key
+                if embed_base_url:
+                    embed_kwargs["base_url"] = embed_base_url
+                embedding_model = OpenAIEmbeddings(
+                    model=self.memory_config.embedding_model,
+                    **embed_kwargs,
+                )
+            else:
+                # For Anthropic, use a lightweight OpenAI-compatible embedding
+                # or skip embeddings (fallback to keyword search)
+                logger.info(
+                    "No embedding model configured for provider '%s', "
+                    "recall_memory will use keyword search",
+                    model_provider,
+                )
+        except Exception as e:
+            logger.warning("Failed to create embedding model: %s", e)
+
+        try:
+            return MemoryRetriever(
+                pg_conn=pg_conn,
+                embedding_model=embedding_model,
+            )
+        except Exception as e:
+            logger.warning("Failed to create memory retriever: %s", e)
+            return None
+
+    def list_conversations(self) -> list[dict]:
+        """返回所有会话的元数据列表。"""
+        conn = getattr(self, "_pg_conn", None)
+        if not conn:
+            return []
+        try:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    SELECT ta.thread_id, ta.label, ta.last_active_at
+                    FROM thread_activity ta
+                    ORDER BY ta.last_active_at DESC
+                """)
+                rows = cur.fetchall()
+                result = []
+                for row in rows:
+                    if isinstance(row, dict):
+                        tid = row["thread_id"]
+                        label = row.get("label") or tid
+                        last_active = row["last_active_at"]
+                    else:
+                        tid = row[0]
+                        label = row[1] or tid
+                        last_active = row[2]
+                    result.append({
+                        "id": tid,
+                        "label": label,
+                        "lastActiveAt": last_active.isoformat() if hasattr(last_active, "isoformat") else str(last_active),
+                    })
+                return result
+        except Exception as e:
+            logger.warning("Failed to list conversations: %s", e)
+            return []
+
+    def delete_conversation(self, thread_id: str):
+        """删除指定会话的所有数据。"""
+        conn = getattr(self, "_pg_conn", None)
+        if not conn:
+            return
+        try:
+            with conn.cursor() as cur:
+                for table in ("checkpoints", "checkpoint_blobs", "checkpoint_writes"):
+                    cur.execute(f"DELETE FROM {table} WHERE thread_id = %s", (thread_id,))
+                cur.execute("DELETE FROM conversation_summaries WHERE thread_id = %s", (thread_id,))
+                cur.execute("DELETE FROM thread_activity WHERE thread_id = %s", (thread_id,))
+            # Clean up vector store
+            if self.retriever:
+                self.retriever.delete_thread(thread_id)
+            logger.info("Deleted conversation: %s", thread_id)
+        except Exception as e:
+            logger.warning("Failed to delete conversation %s: %s", thread_id, e)
+
+    def rename_conversation(self, thread_id: str, label: str):
+        """重命名会话。"""
+        conn = getattr(self, "_pg_conn", None)
+        if not conn:
+            return
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "UPDATE thread_activity SET label = %s WHERE thread_id = %s",
+                    (label, thread_id),
+                )
+        except Exception as e:
+            logger.warning("Failed to rename conversation %s: %s", thread_id, e)
 
     def _build_system_prompt(self) -> str:
         """
@@ -160,13 +451,20 @@ class LangChainSkillsAgent:
         这是 Level 1 的核心：将所有 Skills 的元数据注入到 system prompt。
         每个 skill 约 100 tokens，启动时一次性加载。
         """
-        base_prompt = """You are a helpful coding assistant with access to specialized skills.
+        base_prompt = f"""You are a helpful coding assistant with access to specialized skills.
 
 Your capabilities include:
 - Loading and using specialized skills for specific tasks
 - Executing bash commands and scripts
 - Reading and writing files
 - Following skill instructions to complete complex tasks
+
+Working directory: {self.working_directory}
+Output directory: {self.working_directory / "output"}
+
+IMPORTANT: When creating output files, generated scripts, temporary files, or any other artifacts,
+always place them in the output directory ({self.working_directory / "output"}).
+Do NOT create files in the project root directory.
 
 When a user request matches a skill's description, use the load_skill tool to get detailed instructions before proceeding."""
 
@@ -232,7 +530,7 @@ When a user request matches a skill's description, use the load_skill tool to ge
             tools=ALL_TOOLS,
             system_prompt=self.system_prompt,
             context_schema=SkillAgentContext,
-            checkpointer=InMemorySaver(),
+            checkpointer=self.checkpointer,
         )
 
         return agent
@@ -279,6 +577,121 @@ When a user request matches a skill's description, use the load_skill tool to ge
             for s in skills
         ]
 
+    def get_thread_history(self, thread_id: str) -> list[dict]:
+        """
+        从 checkpointer 获取线程的消息历史，转换为前端事件格式。
+
+        Args:
+            thread_id: 会话 ID
+
+        Returns:
+            前端 timeline entries 列表
+        """
+        config = {"configurable": {"thread_id": thread_id}}
+        try:
+            state = self.agent.get_state(config)
+        except Exception:
+            return []
+        if not state or not state.values:
+            return []
+        messages = state.values.get("messages", [])
+        return self._messages_to_timeline(messages)
+
+    def _messages_to_timeline(self, messages: list) -> list[dict]:
+        """
+        将 LangChain messages 转换为前端 timeline entries 格式。
+
+        - HumanMessage → {kind: "user", ...}
+        - AIMessage → {kind: "assistant", ...}
+        - ToolMessage → 附加到前一个 assistant entry 的 tools 中
+        """
+        entries: list[dict] = []
+        entry_counter = 0
+
+        for msg in messages:
+            if isinstance(msg, HumanMessage):
+                entry_counter += 1
+                text = msg.content if isinstance(msg.content, str) else str(msg.content)
+                entries.append({
+                    "kind": "user",
+                    "id": f"hist-user-{entry_counter}",
+                    "text": text,
+                    "createdAt": 0,
+                })
+
+            elif isinstance(msg, AIMessage):
+                entry_counter += 1
+                thinking = ""
+                response = ""
+                tools: list[dict] = []
+
+                content = msg.content
+                if isinstance(content, str):
+                    response = content
+                elif isinstance(content, list):
+                    for block in content:
+                        if isinstance(block, str):
+                            response += block
+                        elif isinstance(block, dict):
+                            btype = block.get("type", "")
+                            if btype in ("thinking", "reasoning"):
+                                thinking += block.get("thinking", "") or block.get("reasoning", "")
+                            elif btype == "text":
+                                response += block.get("text", "")
+
+                if hasattr(msg, "tool_calls") and msg.tool_calls:
+                    for tc in msg.tool_calls:
+                        tool_id = tc.get("id", f"hist-tool-{entry_counter}-{len(tools)}")
+                        tools.append({
+                            "id": tool_id,
+                            "name": tc.get("name", "unknown"),
+                            "args": tc.get("args", {}),
+                            "status": "success",
+                            "expanded": False,
+                        })
+
+                entries.append({
+                    "kind": "assistant",
+                    "id": f"hist-assistant-{entry_counter}",
+                    "createdAt": 0,
+                    "phase": "done",
+                    "thinking": thinking,
+                    "response": response,
+                    "tools": tools,
+                    "collapsed": True,
+                })
+
+            elif isinstance(msg, ToolMessage):
+                # 附加到最近一个 assistant entry 的 tools 中
+                if entries and entries[-1].get("kind") == "assistant":
+                    assistant_entry = entries[-1]
+                    tool_name = getattr(msg, "name", "unknown")
+                    raw_content = str(getattr(msg, "content", ""))
+                    success = not raw_content.strip().startswith("[FAILED]")
+
+                    matched = False
+                    for tool in assistant_entry["tools"]:
+                        if tool["name"] == tool_name and "result" not in tool:
+                            tool["result"] = raw_content[:2000]
+                            tool["success"] = success
+                            tool["status"] = "success" if success else "failed"
+                            matched = True
+                            break
+
+                    if not matched:
+                        tool_id = getattr(msg, "tool_call_id", f"hist-toolresult-{entry_counter}")
+                        assistant_entry["tools"].append({
+                            "id": tool_id,
+                            "name": tool_name,
+                            "args": {},
+                            "status": "success" if success else "failed",
+                            "result": raw_content[:2000],
+                            "success": success,
+                            "expanded": False,
+                        })
+
+        return entries
+
     def invoke(self, message: str, thread_id: str = "default") -> dict:
         """
         同步调用 Agent
@@ -321,7 +734,7 @@ When a user request matches a skill's description, use the load_skill tool to ge
         ):
             yield chunk
 
-    def stream_events(self, message: str, thread_id: str = "default") -> Iterator[dict]:
+    def stream_events(self, message: str, thread_id: str = "default", label: str = "") -> Iterator[dict]:
         """
         事件级流式输出，支持 thinking 和 token 级流式
 
@@ -340,6 +753,12 @@ When a user request matches a skill's description, use the load_skill tool to ge
         config = {"configurable": {"thread_id": thread_id}}
         emitter = StreamEventEmitter()
         tracker = ToolCallTracker()
+
+        # 设置当前 thread_id 供 recall_memory 工具使用
+        self.context.current_thread_id = thread_id
+
+        self._touch_thread_activity(thread_id, label=label or None)
+        self._prune_thread_messages(thread_id)
 
         full_response = ""
         debug = os.getenv("SKILLS_DEBUG", "").lower() in ("1", "true", "yes")

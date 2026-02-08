@@ -45,9 +45,25 @@ class SkillAgentContext:
     Agent 运行时上下文
 
     通过 ToolRuntime[SkillAgentContext] 在 tool 中访问
+
+    目录结构:
+      output/            — 最终成果（Markdown 等）
+      output/.artifacts/ — 中间文件（JSON、HTML、脚本、日志等）
     """
     skill_loader: SkillLoader
     working_directory: Path = field(default_factory=Path.cwd)
+    output_directory: Path = field(default=None)
+    artifacts_directory: Path = field(default=None)
+    memory_retriever: object = field(default=None)
+    current_thread_id: str = field(default=None)
+
+    def __post_init__(self):
+        if self.output_directory is None:
+            self.output_directory = self.working_directory / "output"
+        if self.artifacts_directory is None:
+            self.artifacts_directory = self.output_directory / ".artifacts"
+        self.output_directory.mkdir(parents=True, exist_ok=True)
+        self.artifacts_directory.mkdir(parents=True, exist_ok=True)
 
 
 @tool
@@ -265,11 +281,28 @@ def write_file(file_path: str, content: str, runtime: ToolRuntime[SkillAgentCont
     - Create new files
     - Modify existing files
 
+    Output directory convention:
+    - Final deliverables (.md) → output/
+    - Intermediate files (.json, .html, .txt, .py, .log, etc.) → output/.artifacts/
+    When writing to the output directory, non-markdown files are automatically
+    routed to output/.artifacts/ to keep the output directory clean.
+
     Args:
         file_path: Path to the file (absolute or relative to working directory)
         content: Content to write to the file
     """
     path = resolve_path(file_path, runtime.context.working_directory)
+
+    # Auto-route intermediate files in the output directory to .artifacts/
+    output_dir = runtime.context.output_directory
+    artifacts_dir = runtime.context.artifacts_directory
+    try:
+        rel = path.relative_to(output_dir)
+        # Only reroute files directly in output/ (not already in a subdirectory)
+        if rel.parent == Path(".") and path.suffix.lower() not in (".md", ".markdown"):
+            path = artifacts_dir / rel
+    except ValueError:
+        pass  # path is not under output_dir, no rerouting needed
 
     try:
         # 确保父目录存在
@@ -511,4 +544,63 @@ def list_dir(path: str, runtime: ToolRuntime[SkillAgentContext]) -> str:
         return f"[FAILED] {str(e)}"
 
 
-ALL_TOOLS = [load_skill, bash, read_file, write_file, glob, grep, edit, list_dir]
+@tool
+def recall_memory(query: str, runtime: ToolRuntime[SkillAgentContext], topic: str = "") -> str:
+    """
+    Recall detailed information from past conversation history.
+
+    When you see a [Conversation Summary] and [Recallable Topics] in the context,
+    use this tool to retrieve specific details about any topic mentioned.
+    The tool searches through stored conversation fragments using semantic similarity.
+
+    Use this when:
+    - The user refers to something discussed earlier that isn't in recent messages
+    - You need specific details that were summarized away
+    - The conversation summary mentions a topic you need more context on
+
+    Args:
+        query: What to search for (a topic, question, or keyword from the conversation)
+        topic: Optional topic tag to narrow the search (must match one of the [Recallable Topics]).
+               If empty, searches all stored fragments.
+    """
+    retriever = getattr(runtime.context, "memory_retriever", None)
+    thread_id = getattr(runtime.context, "current_thread_id", None)
+
+    if not retriever:
+        return "[No memory store available] Memory retrieval requires PostgreSQL with pgvector."
+
+    if not thread_id:
+        return "[No active thread] Cannot determine which conversation to search."
+
+    top_k = 5  # default
+    try:
+        from .memory.config import MemoryConfig
+        config = MemoryConfig.from_env()
+        top_k = config.recall_top_k
+    except Exception:
+        pass
+
+    results = retriever.search(
+        thread_id,
+        query,
+        top_k=top_k,
+        topic=topic if topic.strip() else None,
+    )
+
+    if not results:
+        hint = f" in topic '{topic}'" if topic.strip() else ""
+        return f"[No results] No stored conversation fragments match '{query}'{hint}."
+
+    parts = [f"[Recalled {len(results)} fragments for '{query}']\n"]
+    for i, r in enumerate(results, 1):
+        score = r.get("score", 0)
+        topics = r.get("topics", [])
+        topic_str = f" (topics: {', '.join(topics)})" if topics else ""
+        parts.append(f"--- Fragment {i}{topic_str} [relevance: {score:.2f}] ---")
+        parts.append(r["chunk"])
+        parts.append("")
+
+    return "\n".join(parts)
+
+
+ALL_TOOLS = [load_skill, bash, read_file, write_file, glob, grep, edit, list_dir, recall_memory]

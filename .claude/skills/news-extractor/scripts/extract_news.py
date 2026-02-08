@@ -124,21 +124,25 @@ def extract_news(
 
     # 4. 创建输出目录
     output_path = Path(output_dir)
+    artifacts_path = output_path / ".artifacts"
     output_path.mkdir(parents=True, exist_ok=True)
+    artifacts_path.mkdir(parents=True, exist_ok=True)
 
     # 5. 生成输出文件
+    #    - Markdown（最终成果）→ output/
+    #    - JSON（中间数据）→ output/.artifacts/
     news_id = news_item.news_id or "untitled"
     # 清理文件名中的非法字符
     safe_id = "".join(c if c.isalnum() or c in "-_" else "_" for c in news_id)
 
-    # JSON 输出
+    # JSON 输出（中间数据）
     if output_format in ("json", "both"):
-        json_file = output_path / f"{safe_id}.json"
+        json_file = artifacts_path / f"{safe_id}.json"
         with open(json_file, "w", encoding="utf-8") as f:
             json.dump(news_item.to_dict(), f, ensure_ascii=False, indent=2)
         log_success(f"Saved: {json_file}")
 
-    # Markdown 输出
+    # Markdown 输出（最终成果）
     if output_format in ("markdown", "both"):
         md_file = output_path / f"{safe_id}.md"
         markdown_content = to_markdown(news_item, platform=detected_platform)

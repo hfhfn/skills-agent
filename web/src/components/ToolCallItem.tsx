@@ -52,7 +52,7 @@ function linesWithTreePrefix(content: string, expanded: boolean): {
 } {
   const normalized = content.trimEnd();
   if (!normalized) {
-    return { lines: ["└ (no output)"], hiddenCount: 0, totalLines: 1 };
+    return { lines: ["└ (无输出)"], hiddenCount: 0, totalLines: 1 };
   }
 
   const rawLines = normalized.split("\n");
@@ -96,7 +96,7 @@ export const ToolCallItem = memo(function ToolCallItem({
       </header>
 
       {tool.skillName && (
-        <div className="tool-call__skill-tag">Detected skill: {tool.skillName}</div>
+        <div className="tool-call__skill-tag">检测到技能: {tool.skillName}</div>
       )}
 
       {tool.result && (
@@ -108,7 +108,7 @@ export const ToolCallItem = memo(function ToolCallItem({
               className="link-button"
               onClick={() => onToggleExpand(assistantId, tool.id)}
             >
-              Show {hiddenCount} more lines
+              展开剩余 {hiddenCount} 行
             </button>
           )}
           {hiddenCount === 0 && expanded && totalLines > MAX_VISIBLE_LINES && (
@@ -117,7 +117,7 @@ export const ToolCallItem = memo(function ToolCallItem({
               className="link-button"
               onClick={() => onToggleExpand(assistantId, tool.id)}
             >
-              {expanded ? "Collapse output" : "Expand output"}
+              {expanded ? "收起输出" : "展开输出"}
             </button>
           )}
         </div>

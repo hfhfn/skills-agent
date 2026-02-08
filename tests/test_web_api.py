@@ -25,7 +25,7 @@ class FakeAgent:
     def get_system_prompt(self) -> str:
         return "You are a test agent."
 
-    def stream_events(self, message: str, thread_id: str = "default") -> Iterator[dict]:
+    def stream_events(self, message: str, thread_id: str = "default", label: str = "") -> Iterator[dict]:
         if message == "explode":
             raise RuntimeError("boom")
 

@@ -18,21 +18,21 @@ export const SkillPanel = memo(function SkillPanel({
   return (
     <aside className="skills-panel">
       <header className="skills-panel__header">
-        <p className="eyebrow">Capabilities</p>
-        <h2>Discovered Skills</h2>
+        <p className="eyebrow">能力</p>
+        <h2>已发现技能</h2>
       </header>
 
-      {loading && <p className="skills-panel__hint">Scanning skills...</p>}
+      {loading && <p className="skills-panel__hint">正在扫描技能...</p>}
       {error && <p className="skills-panel__error">{error}</p>}
 
       {!loading && !error && skills.length === 0 && (
-        <p className="skills-panel__hint">No skills found.</p>
+        <p className="skills-panel__hint">未发现可用技能。</p>
       )}
 
       <ul className="skills-list">
         {skills.map((skill) => {
           const active = skill.name === activeSkillName;
-          const description = skill.description || "No description provided.";
+          const description = skill.description || "暂无描述";
           return (
             <li
               key={skill.name}
@@ -40,7 +40,7 @@ export const SkillPanel = memo(function SkillPanel({
             >
               <div className="skill-card__title-row">
                 <h3>{skill.name}</h3>
-                {active && <span className="skill-card__badge">In Use</span>}
+                {active && <span className="skill-card__badge">使用中</span>}
               </div>
               <p className="skill-card__description" title={description}>
                 {description}

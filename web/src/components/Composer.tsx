@@ -36,11 +36,11 @@ export const Composer = memo(function Composer({ disabled, onSubmit }: ComposerP
           }
         }}
         rows={3}
-        placeholder='Type a request, or use "/skills" / "/prompt"...'
+        placeholder='输入任务描述，或使用 "/skills" / "/prompt"...'
       />
       <div className="composer__actions">
         <button type="submit" disabled={disabled || !value.trim()}>
-          Send
+          发送
         </button>
       </div>
     </form>

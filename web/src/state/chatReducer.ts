@@ -1,3 +1,4 @@
+import type { ConversationInfo } from "../components/ConversationList";
 import type {
   AgentStreamEvent,
   DoneEvent,
@@ -51,6 +52,7 @@ export type AssistantEntry = {
   response: string;
   tools: ToolCallView[];
   error?: string;
+  collapsed?: boolean;
 };
 
 export type SystemEntry = {
@@ -81,6 +83,8 @@ export type ChatState = {
   activeThreadId: string;
   isStreaming: boolean;
   streamError?: string;
+  /** Incremented each time conversations are loaded from backend. */
+  conversationsVersion: number;
 };
 
 export type ChatAction =
@@ -118,28 +122,63 @@ export type ChatAction =
       toolId: string;
     }
   | {
+      type: "restore_thread";
+      threadId: string;
+      entries: TimelineEntry[];
+    }
+  | {
+      type: "toggle_collapse";
+      threadId: string;
+      assistantEntryId: string;
+    }
+  | {
       type: "stream_failed";
       threadId: string;
       assistantEntryId: string;
       message: string;
-    };
+    }
+  | { type: "conversations_loaded"; conversations: ConversationInfo[] }
+  | { type: "delete_thread"; threadId: string }
+  | { type: "rename_thread"; threadId: string; label: string };
 
-const DEFAULT_THREAD_ID = "thread-1";
+function generateThreadId(): string {
+  if (typeof crypto !== "undefined" && typeof crypto.randomUUID === "function") {
+    return `thread-${crypto.randomUUID()}`;
+  }
+  return `thread-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+}
+
+/**
+ * 从现有会话标签中解析最大编号，返回下一个编号。
+ * 例如已有"会话 1"和"会话 3"，返回 4。
+ */
+export function getNextConversationNumber(threads: Record<string, ThreadState>): number {
+  let max = 0;
+  for (const thread of Object.values(threads)) {
+    const match = thread.label.match(/^会话\s*(\d+)$/);
+    if (match) {
+      max = Math.max(max, parseInt(match[1], 10));
+    }
+  }
+  return max + 1;
+}
 
 export function createInitialState(): ChatState {
+  const defaultId = generateThreadId();
   return {
     skills: [],
     skillsLoaded: false,
     threads: {
-      [DEFAULT_THREAD_ID]: {
-        id: DEFAULT_THREAD_ID,
-        label: "Thread 1",
+      [defaultId]: {
+        id: defaultId,
+        label: "会话 1",
         timeline: [],
       },
     },
-    threadOrder: [DEFAULT_THREAD_ID],
-    activeThreadId: DEFAULT_THREAD_ID,
+    threadOrder: [defaultId],
+    activeThreadId: defaultId,
     isStreaming: false,
+    conversationsVersion: 0,
   };
 }
 
@@ -299,6 +338,7 @@ function applyDoneEvent(
     ...assistant,
     phase: "done",
     response: assistant.response || event.response || "",
+    collapsed: true,
   };
 }
 
@@ -518,6 +558,34 @@ export function chatReducer(state: ChatState, action: ChatAction): ChatState {
       return replaceThread(state, action.threadId, updatedThread);
     }
 
+    case "restore_thread": {
+      const thread = getThread(state, action.threadId);
+      if (!thread) {
+        return state;
+      }
+      const restoredThread: ThreadState = {
+        ...thread,
+        timeline: action.entries,
+      };
+      return replaceThread(state, action.threadId, restoredThread);
+    }
+
+    case "toggle_collapse": {
+      const thread = getThread(state, action.threadId);
+      if (!thread) {
+        return state;
+      }
+      const updatedThread = updateAssistantEntry(
+        thread,
+        action.assistantEntryId,
+        (assistant) => ({
+          ...assistant,
+          collapsed: !assistant.collapsed,
+        }),
+      );
+      return replaceThread(state, action.threadId, updatedThread);
+    }
+
     case "stream_failed": {
       const thread = getThread(state, action.threadId);
       if (!thread) {
@@ -546,6 +614,67 @@ export function chatReducer(state: ChatState, action: ChatAction): ChatState {
         isStreaming: false,
         streamError: action.message,
       };
+    }
+
+    case "conversations_loaded": {
+      const threads: Record<string, ThreadState> = {};
+      const threadOrder: string[] = [];
+      for (const conv of action.conversations) {
+        // Preserve existing timeline if we already have data for this thread
+        const existing = state.threads[conv.id];
+        threads[conv.id] = {
+          id: conv.id,
+          label: conv.label,
+          timeline: existing?.timeline ?? [],
+          activeAssistantEntryId: existing?.activeAssistantEntryId,
+          activeSkillName: existing?.activeSkillName,
+        };
+        threadOrder.push(conv.id);
+      }
+      // If no conversations from backend, keep the default
+      if (threadOrder.length === 0) {
+        return state;
+      }
+      // Keep activeThreadId if it exists in new list, otherwise pick first
+      const activeId = threadOrder.includes(state.activeThreadId)
+        ? state.activeThreadId
+        : threadOrder[0];
+      return {
+        ...state,
+        threads,
+        threadOrder,
+        activeThreadId: activeId,
+        conversationsVersion: (state.conversationsVersion ?? 0) + 1,
+      };
+    }
+
+    case "delete_thread": {
+      const { [action.threadId]: _removed, ...remainingThreads } = state.threads;
+      const remainingOrder = state.threadOrder.filter((id) => id !== action.threadId);
+      if (remainingOrder.length === 0) {
+        // Don't delete last thread; reset it instead
+        return state;
+      }
+      const nextActive = state.activeThreadId === action.threadId
+        ? remainingOrder[0]
+        : state.activeThreadId;
+      return {
+        ...state,
+        threads: remainingThreads,
+        threadOrder: remainingOrder,
+        activeThreadId: nextActive,
+      };
+    }
+
+    case "rename_thread": {
+      const thread = getThread(state, action.threadId);
+      if (!thread) {
+        return state;
+      }
+      return replaceThread(state, action.threadId, {
+        ...thread,
+        label: action.label,
+      });
     }
 
     default:

@@ -34,7 +34,19 @@ class AgentLike(Protocol):
     def get_system_prompt(self) -> str:
         ...
 
-    def stream_events(self, message: str, thread_id: str = "default") -> Iterator[dict[str, Any]]:
+    def stream_events(self, message: str, thread_id: str = "default", label: str = "") -> Iterator[dict[str, Any]]:
+        ...
+
+    def get_thread_history(self, thread_id: str) -> list[dict[str, Any]]:
+        ...
+
+    def list_conversations(self) -> list[dict[str, Any]]:
+        ...
+
+    def delete_conversation(self, thread_id: str) -> None:
+        ...
+
+    def rename_conversation(self, thread_id: str, label: str) -> None:
         ...
 
 
@@ -102,10 +114,37 @@ def create_app(agent_provider: Callable[[], AgentLike] | None = None) -> FastAPI
         agent = provider()
         return {"prompt": agent.get_system_prompt()}
 
+    @app.get("/api/chat/history")
+    def chat_history(thread_id: str = Query(..., min_length=1)) -> dict[str, Any]:
+        agent = provider()
+        entries = agent.get_thread_history(thread_id)
+        return {"entries": entries}
+
+    @app.get("/api/conversations")
+    def list_conversations() -> dict[str, Any]:
+        agent = provider()
+        return {"conversations": agent.list_conversations()}
+
+    @app.delete("/api/conversations/{thread_id}")
+    def delete_conversation(thread_id: str) -> dict[str, str]:
+        agent = provider()
+        agent.delete_conversation(thread_id)
+        return {"status": "ok"}
+
+    @app.put("/api/conversations/{thread_id}/label")
+    def rename_conversation(
+        thread_id: str,
+        label: str = Query(..., min_length=1),
+    ) -> dict[str, str]:
+        agent = provider()
+        agent.rename_conversation(thread_id, label)
+        return {"status": "ok"}
+
     @app.get("/api/chat/stream")
     def chat_stream(
         message: str = Query(..., min_length=1),
         thread_id: str = Query("default", min_length=1),
+        label: str = Query("", description="会话显示名称，首次创建时存储"),
     ) -> StreamingResponse:
         def event_stream() -> Iterator[str]:
             error_emitted = False
@@ -117,7 +156,7 @@ def create_app(agent_provider: Callable[[], AgentLike] | None = None) -> FastAPI
                 return
 
             try:
-                for event in agent.stream_events(message, thread_id=thread_id):
+                for event in agent.stream_events(message, thread_id=thread_id, label=label):
                     event_type = str(event.get("type", "message"))
                     if event_type == "error":
                         error_emitted = True

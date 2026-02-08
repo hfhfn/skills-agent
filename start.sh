@@ -3,11 +3,12 @@
 # start.sh — 一键启动 Skills Agent 前后端开发服务器 (Linux / macOS)
 #
 # 功能：
-#   1. 安装后端 Python 依赖 (uv sync)
-#   2. 安装前端 Node 依赖 (npm install)
-#   3. 启动 FastAPI 后端 (SSE 流式接口)
-#   4. 启动 Vite 前端开发服务器 (React)
-#   5. Ctrl+C 时自动清理两个子进程
+#   1. 检测并处理端口占用（8000, 5173）
+#   2. 安装后端 Python 依赖 (uv sync)
+#   3. 安装前端 Node 依赖 (npm install)
+#   4. 启动 FastAPI 后端 (SSE 流式接口)
+#   5. 启动 Vite 前端开发服务器 (React)
+#   6. Ctrl+C 时自动清理两个子进程
 #
 # 环境变量（均可选，有默认值）：
 #   BACKEND_PORT      — 后端端口，默认 8000
@@ -43,6 +44,49 @@ require_cmd() {
   fi
 }
 
+# ── 4b. 工具函数：检测并终止占用指定端口的进程 ────────────────────────────────
+check_and_kill_port() {
+  local port="$1"
+  local service="$2"
+  local pid
+
+  # lsof 方式（macOS / 大部分 Linux）
+  if command -v lsof >/dev/null 2>&1; then
+    pid=$(lsof -ti :"$port" 2>/dev/null || true)
+  # ss 方式（部分 Linux 无 lsof）
+  elif command -v ss >/dev/null 2>&1; then
+    pid=$(ss -tlnp "sport = :$port" 2>/dev/null | grep -oP 'pid=\K[0-9]+' | head -1 || true)
+  fi
+
+  if [[ -n "$pid" ]]; then
+    echo "[start] Port $port ($service) is occupied by PID $pid, terminating..."
+    kill "$pid" 2>/dev/null || true
+    sleep 1
+    # 如果还没退出，强制终止
+    if kill -0 "$pid" 2>/dev/null; then
+      kill -9 "$pid" 2>/dev/null || true
+    fi
+    echo "[start] Port $port freed."
+  fi
+}
+
+# 工具函数：检查端口占用（仅提示，不终止）
+check_port_info() {
+  local port="$1"
+  local service="$2"
+  local pid
+
+  if command -v lsof >/dev/null 2>&1; then
+    pid=$(lsof -ti :"$port" 2>/dev/null || true)
+  elif command -v ss >/dev/null 2>&1; then
+    pid=$(ss -tlnp "sport = :$port" 2>/dev/null | grep -oP 'pid=\K[0-9]+' | head -1 || true)
+  fi
+
+  if [[ -n "$pid" ]]; then
+    echo "[start] Info: Port $port ($service) is in use by PID $pid (expected if already running)."
+  fi
+}
+
 # ── 5. 清理函数：退出时关闭所有子进程 ────────────────────────────────────────
 cleanup() {
   # 先移除 trap，避免递归调用
@@ -74,6 +118,11 @@ if [[ ! -d "$WEB_DIR" ]]; then
   echo "[start] Frontend directory not found: $WEB_DIR"
   exit 1
 fi
+
+# ── 6b. 端口冲突检测和处理 ─────────────────────────────────────────────────
+check_and_kill_port "$BACKEND_PORT" "Backend"
+check_and_kill_port "$FRONTEND_PORT" "Frontend"
+check_port_info 5432 "PostgreSQL"
 
 # ── 7. 安装后端 Python 依赖 ──────────────────────────────────────────────────
 echo "[start] Installing backend dependencies with uv sync..."

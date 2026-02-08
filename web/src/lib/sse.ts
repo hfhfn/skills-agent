@@ -13,6 +13,7 @@ type StreamOptions = {
   apiBaseUrl: string;
   message: string;
   threadId: string;
+  label?: string;
   onEvent: (event: AgentStreamEvent) => void;
   onError: (error: string) => void;
 };
@@ -25,12 +26,16 @@ export function openChatStream({
   apiBaseUrl,
   message,
   threadId,
+  label,
   onEvent,
   onError,
 }: StreamOptions): () => void {
   const endpoint = new URL(`${normalizeBaseUrl(apiBaseUrl)}/api/chat/stream`);
   endpoint.searchParams.set("message", message);
   endpoint.searchParams.set("thread_id", threadId);
+  if (label) {
+    endpoint.searchParams.set("label", label);
+  }
 
   const source = new EventSource(endpoint.toString());
   let terminalEventHandled = false;
@@ -47,7 +52,7 @@ export function openChatStream({
         }
       } catch (err) {
         const messageFromError = err instanceof Error ? err.message : String(err);
-        onError(`Failed to parse SSE payload: ${messageFromError}`);
+        onError(`SSE 消息解析失败: ${messageFromError}`);
         source.close();
       }
     });
@@ -57,7 +62,7 @@ export function openChatStream({
     if (terminalEventHandled) {
       return;
     }
-    onError("SSE connection failed.");
+    onError("SSE 连接失败。");
     source.close();
   };
 
