@@ -103,7 +103,11 @@ Skills 搜索路径（优先级从高到低）：
 
 | 变量 | 说明 |
 |------|------|
-| `ANTHROPIC_AUTH_TOKEN` / `ANTHROPIC_API_KEY` | API Key |
-| `ANTHROPIC_BASE_URL` | 代理地址（可选） |
+| `MODEL_PROVIDER` | 模型 provider（如 `openai`、`anthropic`），未设置时自动推断 |
+| `API_KEY` | 通用 API Key（优先级高于 `ANTHROPIC_*` 系列） |
+| `API_BASE_URL` | 通用 API Base URL（用于 OpenAI 兼容接口） |
+| `ANTHROPIC_AUTH_TOKEN` / `ANTHROPIC_API_KEY` | Anthropic API Key |
+| `ANTHROPIC_BASE_URL` | Anthropic 代理地址（可选） |
 | `CLAUDE_MODEL` | 模型名称，默认 `claude-sonnet-4-5-20250929` |
+| `ENABLE_STREAMING` | 是否流式输出（默认 `true`），设 `false` 强制非流式 |
 | `MAX_TOKENS` | 最大 tokens，默认 16000 |

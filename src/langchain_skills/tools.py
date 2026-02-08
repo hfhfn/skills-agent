@@ -23,6 +23,22 @@ from .skill_loader import SkillLoader
 from .stream import resolve_path
 
 
+# 工具输出最大字符数（防止单次工具调用撑爆 LLM 上下文窗口）
+# 30,000 字符 ≈ 7,500-10,000 tokens，对大多数模型是安全的
+MAX_TOOL_OUTPUT_CHARS = 30000
+
+
+def _truncate_output(text: str, max_chars: int = MAX_TOOL_OUTPUT_CHARS) -> str:
+    """截断工具输出，防止超出 LLM 上下文窗口"""
+    if len(text) <= max_chars:
+        return text
+    return (
+        text[:max_chars]
+        + f"\n\n... [output truncated: {len(text):,} chars total, showing first {max_chars:,}]"
+        + "\n[Tip: redirect large output to a file, then use read_file with offset to process in segments]"
+    )
+
+
 @dataclass
 class SkillAgentContext:
     """
@@ -68,16 +84,20 @@ def load_skill(skill_name: str, runtime: ToolRuntime[SkillAgentContext]) -> str:
     scripts_dir = skill_path / "scripts"
 
     # 构建路径信息
+    # 使用 --directory 让 uv 以 skill 目录为项目根，
+    # 这样 uv run 会使用 skill 自己的 pyproject.toml 和虚拟环境
     path_info = f"""
 ## Skill Path Info
 
 - **Skill Directory**: `{skill_path}`
 - **Scripts Directory**: `{scripts_dir}`
 
-**Important**: When running scripts, use absolute paths like:
+**Important**: Skills have their own dependencies (pyproject.toml). You MUST use `--directory` so `uv` resolves the skill's own virtual environment:
 ```bash
-uv run {scripts_dir}/script_name.py [args]
+uv run --directory {skill_path} scripts/script_name.py [args]
 ```
+
+Do NOT run `uv run {scripts_dir}/script_name.py` directly — that would use the main project's dependencies, which may lack required packages.
 """
 
     # 返回 instructions 和路径信息
@@ -148,7 +168,7 @@ def bash(command: str, runtime: ToolRuntime[SkillAgentContext]) -> str:
         if not result.stdout and not result.stderr:
             parts.append("(no output)")
 
-        return "\n".join(parts)
+        return _truncate_output("\n".join(parts))
 
     except subprocess.TimeoutExpired:
         return "[FAILED] Command timed out after 300 seconds."
@@ -157,17 +177,29 @@ def bash(command: str, runtime: ToolRuntime[SkillAgentContext]) -> str:
 
 
 @tool
-def read_file(file_path: str, runtime: ToolRuntime[SkillAgentContext]) -> str:
+def read_file(file_path: str, runtime: ToolRuntime[SkillAgentContext], offset: int = 0, limit: int = 2000) -> str:
     """
-    Read the contents of a file.
+    Read the contents of a file, with support for paginated reading.
 
     Use this to:
     - Read skill documentation files
     - View script output files
     - Inspect any text file
 
+    For large files (HTML, logs, data), use offset to read in segments:
+      1. read_file("large.html")                → lines 1-2000
+      2. read_file("large.html", offset=2000)   → lines 2001-4000
+      3. Continue until you have enough content
+
+    Strategy for summarizing large files:
+      - Read a segment, extract/summarize key information
+      - Read the next segment, repeat
+      - Combine all segment summaries into a final result
+
     Args:
         file_path: Path to the file (absolute or relative to working directory)
+        offset: Starting line number (0-based, default 0). Use to page through large files.
+        limit: Max lines to read per call (default 2000, capped at 2000).
     """
     path = resolve_path(file_path, runtime.context.working_directory)
 
@@ -180,16 +212,42 @@ def read_file(file_path: str, runtime: ToolRuntime[SkillAgentContext]) -> str:
     try:
         content = path.read_text(encoding="utf-8")
         lines = content.split("\n")
+        total_lines = len(lines)
+        file_size = len(content)
+
+        # 分段参数
+        max_lines = max(1, min(limit, 2000))
+        start = max(0, offset)
+        end = min(start + max_lines, total_lines)
+        selected = lines[start:end]
 
         # 添加行号
         numbered_lines = []
-        for i, line in enumerate(lines[:2000], 1):  # 限制行数
+        for i, line in enumerate(selected, start + 1):
             numbered_lines.append(f"{i:4d}| {line}")
 
-        if len(lines) > 2000:
-            numbered_lines.append(f"... ({len(lines) - 2000} more lines)")
+        result = "\n".join(numbered_lines)
 
-        return "\n".join(numbered_lines)
+        # 字符级截断（硬安全线）
+        if len(result) > MAX_TOOL_OUTPUT_CHARS:
+            result = result[:MAX_TOOL_OUTPUT_CHARS]
+            # 计算实际显示到了第几行
+            shown_lines = result.count("\n") + 1
+            next_offset = start + shown_lines
+            result += (
+                f"\n\n... [output truncated at {MAX_TOOL_OUTPUT_CHARS:,} chars]"
+                f"\n[File: {total_lines:,} lines, {file_size:,} bytes]"
+                f"\n[Shown: lines {start + 1}-{next_offset} of {total_lines:,}]"
+                f"\n[To continue: read_file(\"{file_path}\", offset={next_offset})]"
+                f"\n[Tip: read each segment, summarize it, then combine summaries]"
+            )
+        elif end < total_lines:
+            result += (
+                f"\n... ({total_lines - end:,} more lines)"
+                f"\n[To continue: read_file(\"{file_path}\", offset={end})]"
+            )
+
+        return result
 
     except UnicodeDecodeError:
         return f"[Error] Cannot read file (binary or unknown encoding): {file_path}"

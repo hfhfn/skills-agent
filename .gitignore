@@ -20,3 +20,6 @@ build/
 
 # 输出目录
 output/
+
+# Windows device files
+nul

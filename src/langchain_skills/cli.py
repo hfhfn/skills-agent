@@ -165,6 +165,50 @@ class StreamState:
         }
 
 
+def _parse_invoke_result(result: dict) -> StreamState:
+    """
+    将 invoke 结果解析为 StreamState 用于显示
+
+    从完整的 messages 列表中提取工具调用、工具结果和最终响应。
+    """
+    state = StreamState()
+    messages = result.get("messages", [])
+
+    for msg in messages:
+        if isinstance(msg, AIMessage):
+            # 提取工具调用
+            if hasattr(msg, "tool_calls") and msg.tool_calls:
+                for tc in msg.tool_calls:
+                    state.tool_calls.append({
+                        "id": tc.get("id", ""),
+                        "name": tc.get("name", ""),
+                        "args": tc.get("args", {}),
+                    })
+
+        elif isinstance(msg, ToolMessage):
+            state.tool_results.append({
+                "name": getattr(msg, "name", "unknown"),
+                "content": str(getattr(msg, "content", "")),
+            })
+
+    # 从最后一条 AIMessage 提取响应文本
+    for msg in reversed(messages):
+        if isinstance(msg, AIMessage) and msg.content:
+            if isinstance(msg.content, str):
+                state.response_text = msg.content
+            elif isinstance(msg.content, list):
+                text_parts = []
+                for part in msg.content:
+                    if isinstance(part, dict) and part.get("type") == "text":
+                        text_parts.append(part.get("text", ""))
+                    elif isinstance(part, str):
+                        text_parts.append(part)
+                state.response_text = "\n".join(text_parts)
+            break
+
+    return state
+
+
 def display_final_results(
     state: StreamState,
     thinking_max_length: int = DisplayLimits.THINKING_FINAL,
@@ -536,7 +580,9 @@ def cmd_show_prompt():
 
 def cmd_run(prompt: str, enable_thinking: bool = True):
     """
-    执行单次请求，支持流式输出和 thinking 显示
+    执行单次请求
+
+    思考模型使用流式输出（实时显示 thinking），非思考模型使用同步调用。
 
     Args:
         prompt: 用户请求
@@ -545,43 +591,51 @@ def cmd_run(prompt: str, enable_thinking: bool = True):
     console.print(Panel(f"[bold cyan]User Request:[/bold cyan]\n{prompt}"))
     console.print()
 
-    # 检查 API 认证（支持 ANTHROPIC_API_KEY 或 ANTHROPIC_AUTH_TOKEN）
+    # 检查 API 认证
     if not check_api_credentials():
         console.print("[red]Error: API credentials not set[/red]")
-        console.print("Please set ANTHROPIC_API_KEY or ANTHROPIC_AUTH_TOKEN in .env file")
+        console.print("Please set API_KEY or ANTHROPIC_API_KEY in .env file")
         sys.exit(1)
 
     agent = LangChainSkillsAgent(enable_thinking=enable_thinking)
 
-    console.print("[dim]Running agent with streaming output...[/dim]\n")
-
     try:
-        state = StreamState()
+        if agent.use_streaming:
+            # 思考模型：流式输出
+            console.print("[dim]Running agent with streaming output...[/dim]\n")
+            state = StreamState()
 
-        with Live(console=console, refresh_per_second=10, transient=True) as live:
-            # 立即显示等待状态
-            live.update(create_streaming_display(is_waiting=True))
+            with Live(console=console, refresh_per_second=10, transient=True) as live:
+                live.update(create_streaming_display(is_waiting=True))
 
-            for event in agent.stream_events(prompt):
-                event_type = state.handle_event(event)
+                for event in agent.stream_events(prompt):
+                    event_type = state.handle_event(event)
+                    live.update(create_streaming_display(**state.get_display_args()))
 
-                # 更新 Live 显示
-                live.update(create_streaming_display(**state.get_display_args()))
+                    if event_type in ("tool_call", "tool_result"):
+                        live.refresh()
 
-                # tool_call 和 tool_result 时强制刷新
-                # tool_call: 确保"正在执行"状态立即可见
-                # tool_result: 确保"正在分析结果"状态立即可见
-                if event_type in ("tool_call", "tool_result"):
-                    live.refresh()
+            console.print()
+            display_final_results(
+                state,
+                tool_result_max_length=1000,
+                args_max_length=400,
+                show_response_panel=True,
+            )
+        else:
+            # 非思考模型：同步调用
+            console.print("[dim]Running agent...[/dim]\n")
+            with console.status("[cyan]AI 正在处理...[/cyan]", spinner="dots"):
+                result = agent.invoke(prompt)
 
-        # 显示最终结果
-        console.print()
-        display_final_results(
-            state,
-            tool_result_max_length=1000,  # cmd_run 用较长的限制
-            args_max_length=400,
-            show_response_panel=True,
-        )
+            state = _parse_invoke_result(result)
+            display_final_results(
+                state,
+                tool_result_max_length=1000,
+                args_max_length=400,
+                show_thinking=False,
+                show_response_panel=True,
+            )
 
     except Exception as e:
         console.print(f"[red]Error: {e}[/red]")
@@ -590,17 +644,19 @@ def cmd_run(prompt: str, enable_thinking: bool = True):
 
 def cmd_interactive(enable_thinking: bool = True):
     """
-    交互式对话模式，支持流式输出和 thinking 显示
+    交互式对话模式
+
+    思考模型使用流式输出（实时显示 thinking），非思考模型使用同步调用。
 
     Args:
         enable_thinking: 是否启用 thinking 显示
     """
     print_banner()
 
-    # 检查 API 认证（支持 ANTHROPIC_API_KEY 或 ANTHROPIC_AUTH_TOKEN）
+    # 检查 API 认证
     if not check_api_credentials():
         console.print("[red]Error: API credentials not set[/red]")
-        console.print("Please set ANTHROPIC_API_KEY or ANTHROPIC_AUTH_TOKEN in .env file")
+        console.print("Please set API_KEY or ANTHROPIC_API_KEY in .env file")
         sys.exit(1)
 
     agent = LangChainSkillsAgent(enable_thinking=enable_thinking)
@@ -612,8 +668,11 @@ def cmd_interactive(enable_thinking: bool = True):
         console.print(f"  - {skill['name']}")
     console.print()
 
-    thinking_status = "[green]enabled[/green]" if enable_thinking else "[dim]disabled[/dim]"
-    console.print(f"[dim]Extended Thinking: {thinking_status}[/dim]")
+    # 显示模式信息
+    if agent.use_streaming:
+        console.print(f"[dim]Mode: streaming | Model: {agent.model_name}[/dim]")
+    else:
+        console.print(f"[dim]Mode: non-streaming | Model: {agent.model_name}[/dim]")
     console.print("[dim]Commands: /exit to quit, /skills to list skills, /prompt to show system prompt[/dim]\n")
 
     thread_id = "interactive"
@@ -649,37 +708,47 @@ def cmd_interactive(enable_thinking: bool = True):
                 cmd_show_prompt()
                 continue
 
-            # 运行 agent（流式输出）
+            # 运行 agent
             console.print()
 
-            state = StreamState()
+            if agent.use_streaming:
+                # 思考模型：流式输出
+                state = StreamState()
 
-            with Live(console=console, refresh_per_second=10, transient=True) as live:
-                # 立即显示等待状态
-                live.update(create_streaming_display(is_waiting=True))
+                with Live(console=console, refresh_per_second=10, transient=True) as live:
+                    live.update(create_streaming_display(is_waiting=True))
 
-                for event in agent.stream_events(user_input, thread_id=thread_id):
-                    event_type = state.handle_event(event)
+                    for event in agent.stream_events(user_input, thread_id=thread_id):
+                        event_type = state.handle_event(event)
+                        live.update(create_streaming_display(**state.get_display_args()))
 
-                    # 更新 Live 显示
-                    live.update(create_streaming_display(**state.get_display_args()))
+                        if event_type in ("tool_call", "tool_result"):
+                            live.refresh()
 
-                    # tool_call 和 tool_result 时强制刷新
-                    # tool_call: 确保"正在执行"状态立即可见
-                    # tool_result: 确保"正在分析结果"状态立即可见
-                    if event_type in ("tool_call", "tool_result"):
-                        live.refresh()
+                # 显示最终结果（交互模式：简化显示）
+                display_final_results(
+                    state,
+                    thinking_max_length=500,
+                    tool_result_max_length=DisplayLimits.TOOL_RESULT_FINAL,
+                    args_max_length=DisplayLimits.ARGS_FORMATTED,
+                    show_thinking=False,
+                    show_tools=False,
+                    show_response_panel=False,
+                )
+            else:
+                # 非思考模型：同步调用
+                with console.status("[cyan]AI 正在处理...[/cyan]", spinner="dots"):
+                    result = agent.invoke(user_input, thread_id=thread_id)
 
-            # 显示最终结果（交互模式：简化显示，不用 Panel 包裹响应）
-            display_final_results(
-                state,
-                thinking_max_length=500,  # 交互模式用较短的 thinking 显示
-                tool_result_max_length=DisplayLimits.TOOL_RESULT_FINAL,
-                args_max_length=DisplayLimits.ARGS_FORMATTED,
-                show_thinking=False,
-                show_tools=False,
-                show_response_panel=False,  # 交互模式不用 Panel
-            )
+                state = _parse_invoke_result(result)
+                display_final_results(
+                    state,
+                    tool_result_max_length=DisplayLimits.TOOL_RESULT_FINAL,
+                    args_max_length=DisplayLimits.ARGS_FORMATTED,
+                    show_thinking=False,
+                    show_tools=True,
+                    show_response_panel=False,
+                )
 
         except KeyboardInterrupt:
             console.print("\n[dim]Goodbye![/dim]")

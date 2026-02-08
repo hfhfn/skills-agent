@@ -41,25 +41,45 @@ DEFAULT_TEMPERATURE = 1.0  # Extended Thinking 要求温度为 1.0
 DEFAULT_THINKING_BUDGET = 10000
 
 
-def get_anthropic_credentials() -> tuple[str | None, str | None]:
+def get_credentials() -> tuple[str | None, str | None]:
     """
-    获取 Anthropic API 认证信息
+    获取 API 认证信息
 
-    支持多种认证方式：
-    1. ANTHROPIC_API_KEY - 标准 API Key
-    2. ANTHROPIC_AUTH_TOKEN - 第三方代理认证 Token
+    支持通用和 Anthropic 专属环境变量（通用优先）：
+    - API Key: API_KEY > ANTHROPIC_API_KEY > ANTHROPIC_AUTH_TOKEN
+    - Base URL: API_BASE_URL > ANTHROPIC_BASE_URL
 
     Returns:
         (api_key, base_url) 元组
     """
-    api_key = os.getenv("ANTHROPIC_API_KEY") or os.getenv("ANTHROPIC_AUTH_TOKEN")
-    base_url = os.getenv("ANTHROPIC_BASE_URL")
+    api_key = (
+        os.getenv("API_KEY")
+        or os.getenv("ANTHROPIC_API_KEY")
+        or os.getenv("ANTHROPIC_AUTH_TOKEN")
+    )
+    base_url = os.getenv("API_BASE_URL") or os.getenv("ANTHROPIC_BASE_URL")
     return api_key, base_url
+
+
+def _is_anthropic_provider() -> bool:
+    """
+    判断当前是否使用 Anthropic provider
+
+    判断逻辑：
+    1. MODEL_PROVIDER 显式设为 "anthropic" → True
+    2. MODEL_PROVIDER 未设置且模型名包含 "claude" → True
+    3. 其他情况 → False
+    """
+    provider = os.getenv("MODEL_PROVIDER", "").lower()
+    if provider:
+        return provider == "anthropic"
+    model = os.getenv("CLAUDE_MODEL", DEFAULT_MODEL)
+    return "claude" in model.lower()
 
 
 def check_api_credentials() -> bool:
     """检查是否配置了 API 认证"""
-    api_key, _ = get_anthropic_credentials()
+    api_key, _ = get_credentials()
     return api_key is not None
 
 
@@ -100,18 +120,19 @@ class LangChainSkillsAgent:
             skill_paths: Skills 搜索路径
             working_directory: 工作目录
             max_tokens: 最大 tokens
-            temperature: 温度参数 (启用 thinking 时强制为 1.0)
+            temperature: 温度参数 (Anthropic + thinking 启用时强制为 1.0)
             enable_thinking: 是否启用 Extended Thinking
             thinking_budget: thinking 的 token 预算
         """
         # thinking 配置
         self.enable_thinking = enable_thinking
         self.thinking_budget = thinking_budget
+        self.is_anthropic = _is_anthropic_provider()
 
-        # 配置 (启用 thinking 时温度必须为 1.0)
+        # 配置
         self.model_name = model or os.getenv("CLAUDE_MODEL", DEFAULT_MODEL)
         self.max_tokens = max_tokens or int(os.getenv("MAX_TOKENS", str(DEFAULT_MAX_TOKENS)))
-        if enable_thinking:
+        if self.is_anthropic and enable_thinking:
             self.temperature = 1.0  # Anthropic 要求启用 thinking 时温度为 1.0
         else:
             self.temperature = temperature or float(os.getenv("MODEL_TEMPERATURE", str(DEFAULT_TEMPERATURE)))
@@ -162,16 +183,16 @@ When a user request matches a skill's description, use the load_skill tool to ge
         - context_schema: 上下文类型（供 ToolRuntime 使用）
         - checkpointer: 会话记忆
 
-        Extended Thinking 支持:
+        Extended Thinking 支持 (仅 Anthropic):
         - 启用后可获取模型的思考过程
         - 温度必须为 1.0
 
-        认证支持:
-        - 支持 ANTHROPIC_API_KEY 或 ANTHROPIC_AUTH_TOKEN
-        - 支持 ANTHROPIC_BASE_URL 第三方代理
+        多 Provider 支持:
+        - MODEL_PROVIDER 指定 provider（如 openai、anthropic）
+        - 未设置时由 init_chat_model 自动推断
         """
         # 获取认证信息
-        api_key, base_url = get_anthropic_credentials()
+        api_key, base_url = get_credentials()
 
         # 构建初始化参数
         init_kwargs = {
@@ -179,22 +200,29 @@ When a user request matches a skill's description, use the load_skill tool to ge
             "max_tokens": self.max_tokens,
         }
 
-        # 添加认证参数（支持第三方代理）
+        # 添加认证参数
         if api_key:
             init_kwargs["api_key"] = api_key
         if base_url:
             init_kwargs["base_url"] = base_url
 
-        # Extended Thinking 配置（直接传递，避免 model_kwargs 警告）
-        if self.enable_thinking:
+        # Extended Thinking 配置（仅 Anthropic provider）
+        if self.enable_thinking and self.is_anthropic:
             init_kwargs["thinking"] = {
                 "type": "enabled",
                 "budget_tokens": self.thinking_budget,
             }
 
+        # model_provider 参数（未设置时不传，保持自动推断）
+        model_provider = os.getenv("MODEL_PROVIDER")
+        provider_kwargs = {}
+        if model_provider:
+            provider_kwargs["model_provider"] = model_provider
+
         # 初始化模型
         model = init_chat_model(
             self.model_name,
+            **provider_kwargs,
             **init_kwargs,
         )
 
@@ -208,6 +236,24 @@ When a user request matches a skill's description, use the load_skill tool to ge
         )
 
         return agent
+
+    @property
+    def use_streaming(self) -> bool:
+        """
+        是否使用流式输出
+
+        优先级：
+        1. ENABLE_STREAMING 环境变量（显式覆盖）
+        2. enable_thinking 构造参数（默认 True，即默认流式）
+
+        思考模型（Claude/DeepSeek-R1/GLM 等）推荐流式，可实时显示推理过程。
+        非思考模型也可以使用流式，不会有副作用。
+        需要非流式时，设置 ENABLE_STREAMING=false 或使用 --no-thinking。
+        """
+        env_streaming = os.getenv("ENABLE_STREAMING", "").lower()
+        if env_streaming:
+            return env_streaming in ("1", "true", "yes")
+        return self.enable_thinking
 
     def get_system_prompt(self) -> str:
         """

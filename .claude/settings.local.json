@@ -6,7 +6,11 @@
       "Bash(git remote add:*)",
       "Bash(git add:*)",
       "Bash(git commit:*)",
-      "Bash(git push:*)"
+      "Bash(git push:*)",
+      "Bash(uv run python -m pytest:*)",
+      "Bash(dir /s \"D:\\\\工作\\\\LLM_project\\\\langchain_project\\\\skills-agent-proto\\\\.claude\\\\skills\\\\news-extractor\")",
+      "Bash(uv run:*)",
+      "Bash(python:*)"
     ]
   }
 }
