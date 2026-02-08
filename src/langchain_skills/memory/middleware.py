@@ -226,3 +226,45 @@ class MemoryMiddleware:
             total_tokens += msg_tokens
 
         return result
+
+
+class MemoryAgentMiddleware:
+    """
+    LangChain AgentMiddleware adapter for three-tier memory.
+
+    Wraps MemoryMiddleware.apply() inside AgentMiddleware.wrap_model_call(),
+    so LangGraph invokes it automatically before each LLM call.
+
+    The checkpoint still stores the complete history untouched; only the
+    messages the LLM *sees* are trimmed.
+    """
+
+    def __init__(self, memory_middleware: MemoryMiddleware):
+        self.memory = memory_middleware
+
+    def wrap_model_call(self, request, handler):
+        """Intercept model call to apply three-tier memory trimming."""
+        # Extract thread_id from runtime context (SkillAgentContext)
+        thread_id = "default"
+        runtime = getattr(request, "runtime", None)
+        if runtime:
+            ctx = getattr(runtime, "context", None)
+            if ctx:
+                thread_id = getattr(ctx, "current_thread_id", None) or "default"
+
+        messages = list(request.messages)
+        original_count = len(messages)
+
+        # Apply three-tier strategy (handles SystemMessage separation internally)
+        trimmed = self.memory.apply(messages, thread_id=thread_id)
+
+        if len(trimmed) != original_count:
+            logger.info(
+                "MemoryAgentMiddleware: trimmed %d → %d messages for thread %s",
+                original_count,
+                len(trimmed),
+                thread_id,
+            )
+            request = request.override(messages=trimmed)
+
+        return handler(request)

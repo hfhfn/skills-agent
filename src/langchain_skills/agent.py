@@ -26,7 +26,7 @@ from langchain.chat_models import init_chat_model
 from langchain_core.messages import AIMessage, AIMessageChunk, HumanMessage, ToolMessage
 from langgraph.checkpoint.memory import InMemorySaver
 
-from .memory import MemoryConfig, MemoryMiddleware, MemoryRetriever, ConversationSummarizer
+from .memory import MemoryConfig, MemoryMiddleware, MemoryAgentMiddleware, MemoryRetriever, ConversationSummarizer
 from .skill_loader import SkillLoader
 from .tools import ALL_TOOLS, SkillAgentContext
 from .stream import StreamEventEmitter, ToolCallTracker, is_success, DisplayLimits
@@ -524,13 +524,15 @@ When a user request matches a skill's description, use the load_skill tool to ge
             **init_kwargs,
         )
 
-        # 创建 Agent
+        # 创建 Agent（注入三层记忆中间件）
+        agent_middleware = MemoryAgentMiddleware(self.memory_middleware)
         agent = create_agent(
             model=model,
             tools=ALL_TOOLS,
             system_prompt=self.system_prompt,
             context_schema=SkillAgentContext,
             checkpointer=self.checkpointer,
+            middleware=[agent_middleware],
         )
 
         return agent

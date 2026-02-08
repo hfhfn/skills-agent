@@ -13,7 +13,7 @@ enabling semantic recall via the recall_memory tool.
 """
 
 from .config import MemoryConfig
-from .middleware import MemoryMiddleware
+from .middleware import MemoryMiddleware, MemoryAgentMiddleware
 from .retriever import MemoryRetriever
 from .summarizer import ConversationSummarizer
 from .condenser import condense_message
@@ -27,6 +27,7 @@ from .token_budget import (
 __all__ = [
     "MemoryConfig",
     "MemoryMiddleware",
+    "MemoryAgentMiddleware",
     "MemoryRetriever",
     "ConversationSummarizer",
     "TokenBudget",
